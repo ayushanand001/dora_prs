@@ -1,0 +1,155 @@
+name: CI
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: Lint & Code Style
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install flake8
+
+      - name: Check Python syntax & critical errors
+        run: |
+          # Stop build if there are Python syntax errors or undefined names
+          flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics --exclude=.venv,__pycache__
+
+      - name: Lint style warnings
+        run: |
+          # Exit-zero treats all errors as warnings
+          flake8 . --count --exit-zero --max-complexity=10 --max-line-length=120 --statistics --exclude=.venv,__pycache__
+
+  test:
+    name: Test & Coverage (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest-cov
+
+      - name: Run Pytest with Coverage
+        run: |
+          pytest tests/ -v --cov=dora_metrics --cov-report=term-missing --cov-report=xml
+
+      - name: Upload coverage artifact
+        if: matrix.python-version == '3.11'
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: coverage.xml
+          retention-days: 7
+
+  data-validation:
+    name: Data Generation Sanity
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas numpy
+
+      - name: Run generate_mock_data.py
+        run: |
+          python generate_mock_data.py
+
+      - name: Verify data/prs.csv exists and is not empty
+        run: |
+          test -s data/prs.csv || (echo "data/prs.csv is empty or missing" && exit 1)
+          echo "data/prs.csv generated successfully ($(wc -l < data/prs.csv) lines)"
+
+  k8s-validate:
+    name: Kubernetes Manifest Validation
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Validate Kubernetes Manifests
+        run: |
+          kubectl create --dry-run=client --validate=false -f k8s/ -o yaml
+
+  docker-check:
+    name: Docker Build & Health Check Smoke Test
+    needs: [test]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build Docker image
+        run: |
+          docker build -t dora-tracker:smoke-test .
+
+      - name: Run Docker container
+        run: |
+          docker run -d --name dora-smoke-test -p 8501:8501 dora-tracker:smoke-test
+
+      - name: Smoke test health endpoint
+        run: |
+          echo "Waiting for Streamlit server to be ready on port 8501..."
+          for i in {1..20}; do
+            if curl -s -f http://localhost:8501/_stcore/health; then
+              echo "Streamlit health check passed!"
+              exit 0
+            fi
+            echo "Waiting for health check ($i/20)..."
+            sleep 2
+          done
+          echo "Health check failed!"
+          docker logs dora-smoke-test
+          exit 1
+
+      - name: Cleanup container
+        if: always()
+        run: |
+          docker logs dora-smoke-test || true
+          docker rm -f dora-smoke-test || true
